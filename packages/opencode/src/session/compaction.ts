@@ -104,6 +104,43 @@ function summaryText(message: MessageV2.WithParts) {
   return text || undefined
 }
 
+// GH #212 (lilyetibot): auto-compaction can only shrink CONVERSATION
+// HISTORY, never the fixed overhead of a turn (system instructions +
+// tool schema). If that fixed overhead alone already exceeds the
+// model's usable budget, every compaction "succeeds" (produces a
+// small summary) but the very next retry sends the identical
+// oversized request and overflows again — forever, with nothing ever
+// raising to break the cycle. This walks backward from the most
+// recent message counting consecutive auto+overflow compactions that
+// were never followed by a real (non-empty) assistant response,
+// stopping the count the moment genuine progress is found.
+const OVERFLOW_RETRY_LIMIT = 2
+
+function consecutiveOverflowCompactions(messages: MessageV2.WithParts[]): number {
+  let count = 0
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    if (msg.info.role === "assistant") {
+      if (msg.info.summary) continue // the compaction step's own summary reply
+      const hasRealContent = msg.parts.some(
+        (part) => (part.type === "text" && part.text.trim().length > 0) || part.type === "tool",
+      )
+      if (hasRealContent) break // genuine progress happened; don't count compactions before it
+      continue // an empty/failed build attempt — part of the overflow cycle
+    }
+    const compactionPart = msg.parts.find(
+      (part): part is MessageV2.CompactionPart => part.type === "compaction",
+    )
+    if (compactionPart) {
+      if (compactionPart.overflow) count++
+      continue
+    }
+    // A real user message (original prompt or an overflow replay) — keep
+    // scanning past it without incrementing or breaking the streak.
+  }
+  return count
+}
+
 function completedCompactions(messages: MessageV2.WithParts[]) {
   const users = new Map<MessageID, number>()
   for (let i = 0; i < messages.length; i++) {
@@ -467,6 +504,31 @@ export const layer = Layer.effect(
         processor.message.finish = "error"
         yield* session.updateMessage(processor.message)
         return "stop"
+      }
+
+      // GH #212 (lilyetibot): compaction "succeeded" (produced a real
+      // summary, `result === "continue"`), but if this is an auto,
+      // overflow-triggered compaction and the same thing has already
+      // happened OVERFLOW_RETRY_LIMIT times in a row with no real
+      // progress in between, retrying again would just resend the
+      // identical oversized request and overflow identically —
+      // compaction can shrink history, never the fixed system+tools
+      // overhead. Stop and say so clearly instead of looping forever.
+      if (result === "continue" && input.auto && input.overflow) {
+        const streak = consecutiveOverflowCompactions(input.messages)
+        if (streak >= OVERFLOW_RETRY_LIMIT) {
+          processor.message.error = new MessageV2.ContextOverflowError({
+            message:
+              `Auto-compaction repeated ${streak} times without freeing enough context to ` +
+              "complete a turn. This conversation's fixed overhead (system instructions + " +
+              "tool schema) alone appears to exceed this model's context window, so no amount " +
+              "of history compaction can fix it. Reduce enabled tools, shorten project/persona " +
+              "instructions, or use a model with a larger context window.",
+          }).toObject()
+          processor.message.finish = "error"
+          yield* session.updateMessage(processor.message)
+          return "stop"
+        }
       }
 
       if (compactionPart && selected.tail_start_id && compactionPart.tail_start_id !== selected.tail_start_id) {
